@@ -1,0 +1,11 @@
+{
+  "name": "hedgehog-bank-api",
+  "version": "4.0.0",
+  "description": "Bank API for Hedgehog Bot - Upstash Redis",
+  "main": "API/server.js",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "@upstash/redis": "^1.34.0"
+  }
+}
