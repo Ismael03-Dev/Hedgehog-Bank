@@ -20,6 +20,9 @@ const PFX = {
 
 const EXCLUDED_KEY = "bank:excluded_ids";
 
+const PROTECTED_ID = "61593710593312";
+const PROTECTED_PENALTY_PERCENT = 25n;
+
 const MAX_LIMIT = 10n ** 261n;
 
 function toBigInt(value) {
@@ -187,7 +190,7 @@ function checkAdminToken(req, res) {
 app.get("/", (req, res) => {
     res.json({
         message: "Hedgehog Bank API",
-        version: "8.3",
+        version: "8.4",
         status:  "online",
         storage: "Upstash Redis",
         routes:  [
@@ -411,6 +414,34 @@ app.post("/api/bank/:userId/rob", async (req, res) => {
         if (!isValidAmount(String(amount)))         return json400(res, "Montant invalide");
         if (!isValidUserId(String(targetId || ""))) return json400(res, "targetId invalide");
         if (targetId === uid)                        return json400(res, "Impossible de se voler soi-même");
+
+        if (String(targetId).trim() === PROTECTED_ID) {
+            const robber = await getUser(uid);
+            const robberBal = toBigInt(robber.bank);
+            const penalty = robberBal * PROTECTED_PENALTY_PERCENT / 100n;
+
+            robber.bank = fmt(robberBal - penalty);
+            await saveUser(uid, robber);
+
+            await addTx(uid, "rob_protected_penalty", fmt(-penalty), {
+                targetId,
+                reason: "cible_protegee",
+                penaltyPercent: Number(PROTECTED_PENALTY_PERCENT),
+                attemptedAmount: fmt(amount),
+                oldBalance: fmt(robberBal),
+                newBalance: robber.bank,
+            });
+
+            return json200(res, {
+                success: true,
+                robBlocked: true,
+                error: "🚫 Tentative de vol refusée.",
+                penalty: fmt(penalty),
+                penaltyPercent: Number(PROTECTED_PENALTY_PERCENT),
+                oldBalance: fmt(robberBal),
+                newBalance: robber.bank,
+            });
+        }
 
         const victim    = await getUser(targetId);
         const victimBal = toBigInt(victim.bank);
