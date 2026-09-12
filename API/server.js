@@ -50,6 +50,12 @@ function isValidAmount(str) {
     return /^\d+$/.test(s) && s !== "0" && BigInt(s) > 0n;
 }
 
+function isValidAmountAllowZero(str) {
+    if (str === undefined || str === null) return false;
+    const s = String(str).trim();
+    return /^\d+$/.test(s);
+}
+
 function isValidUserId(id) {
     return typeof id === "string" && /^\d+$/.test(id.trim()) && id.trim().length >= 5;
 }
@@ -164,10 +170,24 @@ function validateUserId(req, res) {
     return uid;
 }
 
+function checkAdminToken(req, res) {
+    const token = req.body?.token;
+    const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+    if (!ADMIN_TOKEN) {
+        json500(res, "ADMIN_TOKEN non configuré côté serveur");
+        return false;
+    }
+    if (!token || token !== ADMIN_TOKEN) {
+        res.status(403).json({ success: false, error: "Non autorisé" });
+        return false;
+    }
+    return true;
+}
+
 app.get("/", (req, res) => {
     res.json({
         message: "Hedgehog Bank API",
-        version: "8.2",
+        version: "8.3",
         status:  "online",
         storage: "Upstash Redis",
         routes:  [
@@ -196,6 +216,7 @@ app.get("/", (req, res) => {
             "POST /api/bank/:userId/image",
             "POST /api/bank/admin/reset-above-threshold",
             "POST /api/bank/admin/excluded",
+            "POST /api/bank/admin/set-balance",
         ],
     });
 });
@@ -768,15 +789,10 @@ app.post("/api/bank/:userId/image", async (req, res) => {
 
 app.post("/api/bank/admin/reset-above-threshold", async (req, res) => {
     try {
-        const { token, threshold, confirm } = req.body;
+        if (!checkAdminToken(req, res)) return;
 
-        const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
-        if (!ADMIN_TOKEN) {
-            return json500(res, "ADMIN_TOKEN non configuré côté serveur");
-        }
-        if (!token || token !== ADMIN_TOKEN) {
-            return res.status(403).json({ success: false, error: "Non autorisé" });
-        }
+        const { threshold, confirm } = req.body;
+
         if (confirm !== "RESET_ABOVE_THRESHOLD") {
             return res.status(400).json({
                 success: false,
@@ -848,15 +864,10 @@ app.post("/api/bank/admin/reset-above-threshold", async (req, res) => {
 
 app.post("/api/bank/admin/excluded", async (req, res) => {
     try {
-        const { token, action, userId } = req.body;
+        if (!checkAdminToken(req, res)) return;
 
-        const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
-        if (!ADMIN_TOKEN) {
-            return json500(res, "ADMIN_TOKEN non configuré côté serveur");
-        }
-        if (!token || token !== ADMIN_TOKEN) {
-            return res.status(403).json({ success: false, error: "Non autorisé" });
-        }
+        const { action, userId } = req.body;
+
         if (!["add", "remove", "list", "clear"].includes(String(action))) {
             return json400(res, "action invalide (add / remove / list / clear)");
         }
@@ -886,6 +897,61 @@ app.post("/api/bank/admin/excluded", async (req, res) => {
 
         await saveExcludedIds(list);
         json200(res, { action, userId: id, excluded: list, count: list.length });
+    } catch (e) { json500(res, e.message); }
+});
+
+app.post("/api/bank/admin/set-balance", async (req, res) => {
+    try {
+        if (!checkAdminToken(req, res)) return;
+
+        const { userId, amount, mode } = req.body;
+
+        if (!userId || !isValidUserId(String(userId))) {
+            return json400(res, "userId invalide");
+        }
+        if (!isValidAmountAllowZero(String(amount))) {
+            return json400(res, "amount invalide (chiffres uniquement, 0 autorisé)");
+        }
+
+        const cleanMode = (mode || "set").toLowerCase();
+        if (!["set", "add", "subtract"].includes(cleanMode)) {
+            return json400(res, "mode invalide (set / add / subtract)");
+        }
+
+        const id  = String(userId).trim();
+        const amt = toBigInt(amount);
+
+        const user = await getUser(id);
+        const oldBank = fmt(user.bank);
+
+        let newBank;
+        if (cleanMode === "set") {
+            newBank = amt;
+        } else if (cleanMode === "add") {
+            newBank = toBigInt(user.bank) + amt;
+        } else {
+            newBank = toBigInt(user.bank) - amt;
+            if (newBank < 0n) newBank = 0n;
+        }
+
+        user.bank = fmt(newBank);
+        await saveUser(id, user);
+
+        await addTx(id, "admin_set_balance", fmt(newBank - toBigInt(oldBank)), {
+            reason: "admin_set_balance",
+            mode:   cleanMode,
+            amount: fmt(amt),
+            oldBank,
+            newBank: user.bank,
+        });
+
+        json200(res, {
+            userId: id,
+            mode: cleanMode,
+            oldBalance: oldBank,
+            newBalance: user.bank,
+            appliedAmount: fmt(amt),
+        });
     } catch (e) { json500(res, e.message); }
 });
 
