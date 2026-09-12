@@ -18,6 +18,8 @@ const PFX = {
     INVENTORY:    "bank:inventory:",
 };
 
+const EXCLUDED_KEY = "bank:excluded_ids";
+
 const MAX_LIMIT = 10n ** 261n;
 
 function toBigInt(value) {
@@ -127,6 +129,21 @@ async function addTx(userId, type, amount, details = {}) {
     } catch {}
 }
 
+async function getExcludedIds() {
+    try {
+        let list = await kv.get(EXCLUDED_KEY);
+        if (typeof list === "string") {
+            try { list = JSON.parse(list); } catch { list = []; }
+        }
+        if (!Array.isArray(list)) list = [];
+        return list.map(String);
+    } catch { return []; }
+}
+
+async function saveExcludedIds(list) {
+    await kv.set(EXCLUDED_KEY, JSON.stringify(list.map(String)));
+}
+
 function hasCard(card) {
     return !!(card && card.cardCreated && card.cardNumber && card.cardCvv);
 }
@@ -150,7 +167,7 @@ function validateUserId(req, res) {
 app.get("/", (req, res) => {
     res.json({
         message: "Hedgehog Bank API",
-        version: "8.1",
+        version: "8.2",
         status:  "online",
         storage: "Upstash Redis",
         routes:  [
@@ -178,6 +195,7 @@ app.get("/", (req, res) => {
             "GET  /api/bank/:userId/parrain/stats",
             "POST /api/bank/:userId/image",
             "POST /api/bank/admin/reset-above-threshold",
+            "POST /api/bank/admin/excluded",
         ],
     });
 });
@@ -185,17 +203,23 @@ app.get("/", (req, res) => {
 app.get("/api/bank/top", async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 25, 100);
-        const keys  = await kv.keys(`${PFX.USER}*`);
+
+        const excludedList = await getExcludedIds();
+        const EXCLUDED_IDS = new Set(excludedList);
+
+        const keys = await kv.keys(`${PFX.USER}*`);
         if (!keys.length) return json200(res, { data: [] });
 
         const users = (await Promise.all(keys.map(async key => {
             const userId = key.replace(PFX.USER, "");
+            if (EXCLUDED_IDS.has(userId)) return null;
+
             try {
                 const raw  = await kv.get(key);
                 const data = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {};
                 return { userId, bank: fmt(data.bank || "0") };
-            } catch { return { userId, bank: "0" }; }
-        }))).sort((a, b) => {
+            } catch { return null; }
+        }))).filter(Boolean).sort((a, b) => {
             const d = toBigInt(b.bank) - toBigInt(a.bank);
             return d > 0n ? 1 : d < 0n ? -1 : 0;
         });
@@ -207,11 +231,17 @@ app.get("/api/bank/top", async (req, res) => {
 app.get("/api/bank/leaderboard", async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+
+        const excludedList = await getExcludedIds();
+        const EXCLUDED_IDS = new Set(excludedList);
+
         const keys  = await kv.keys(`${PFX.USER}*`);
         if (!keys.length) return json200(res, { data: [] });
 
         const users = (await Promise.all(keys.map(async key => {
             const userId = key.replace(PFX.USER, "");
+            if (EXCLUDED_IDS.has(userId)) return null;
+
             try {
                 const raw  = await kv.get(key);
                 const data = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {};
@@ -712,117 +742,4 @@ app.post("/api/bank/:userId/parrain/use", async (req, res) => {
     } catch (e) { json500(res, e.message); }
 });
 
-app.get("/api/bank/:userId/parrain/stats", async (req, res) => {
-    try {
-        const uid = validateUserId(req, res);
-        if (!uid) return;
-        const raw = await kv.get(`${PFX.PARRAIN_USER}${uid}`);
-        if (!raw) return json200(res, { success: false, error: "Aucun code créé" });
-        const data = typeof raw === "string" ? JSON.parse(raw) : raw;
-        json200(res, { data: { code: data.code, count: data.count || 0, gains: data.gains || "0" } });
-    } catch (e) { json500(res, e.message); }
-});
-
-app.post("/api/bank/:userId/image", async (req, res) => {
-    try {
-        const uid = validateUserId(req, res);
-        if (!uid) return;
-        const { mode } = req.body;
-        if (!["on","off"].includes(String(mode))) return json400(res, "Mode invalide (on/off)");
-        const user = await getUser(uid);
-        user.imageMode = mode === "on";
-        await saveUser(uid, user);
-        json200(res, { imageMode: user.imageMode });
-    } catch (e) { json500(res, e.message); }
-});
-
-app.post("/api/bank/admin/reset-above-threshold", async (req, res) => {
-    try {
-        const { token, threshold, confirm } = req.body;
-
-        const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
-        if (!ADMIN_TOKEN) {
-            return json500(res, "ADMIN_TOKEN non configuré côté serveur");
-        }
-        if (!token || token !== ADMIN_TOKEN) {
-            return res.status(403).json({ success: false, error: "Non autorisé" });
-        }
-        if (confirm !== "RESET_ABOVE_THRESHOLD") {
-            return res.status(400).json({
-                success: false,
-                error: 'Ajoute { "confirm": "RESET_ABOVE_THRESHOLD" } pour confirmer'
-            });
-        }
-        if (!isValidAmount(String(threshold))) {
-            return json400(res, "threshold invalide (nombre positif en string)");
-        }
-
-        const limit = toBigInt(threshold);
-        const keys  = await kv.keys(`${PFX.USER}*`);
-
-        const results = [];
-        let resetCount = 0;
-
-        for (const key of keys) {
-            const userId = key.replace(PFX.USER, "");
-            try {
-                const raw  = await kv.get(key);
-                if (!raw) continue;
-                const data = typeof raw === "string" ? JSON.parse(raw) : raw;
-                const current = toBigInt(data.bank || "0");
-
-                if (current > limit) {
-                    const oldBank     = fmt(data.bank || "0");
-                    const oldInvested = fmt(data.totalInvested || "0");
-                    const oldSavings  = fmt(data.savings?.amount || "0");
-
-                    data.bank          = "0";
-                    data.totalInvested = "0";
-                    if (data.savings) data.savings.amount = "0";
-                    data.loans         = [];
-                    data.inventory     = [];
-                    data.parrainCount  = 0;
-
-                    await kv.set(key, JSON.stringify(data));
-                    await addTx(userId, "admin_reset", "0", {
-                        reason:      "reset_above_threshold",
-                        threshold:   fmt(limit),
-                        oldBank,
-                        oldInvested,
-                        oldSavings,
-                    });
-
-                    resetCount++;
-                    results.push({
-                        userId,
-                        oldBank,
-                        newBank: "0",
-                        oldInvested,
-                        oldSavings
-                    });
-                }
-            } catch (err) {
-                results.push({ userId, error: err.message });
-            }
-        }
-
-        res.json({
-            success: true,
-            threshold: fmt(limit),
-            totalScanned: keys.length,
-            resetCount,
-            results
-        });
-    } catch (e) { json500(res, e.message); }
-});
-
-app.use((req, res) => {
-    json404(res, `Route introuvable : ${req.method} ${req.path}`);
-});
-
-app.use((err, req, res, next) => {
-    console.error("Erreur non gérée:", err);
-    json500(res, err.message || "Erreur interne");
-});
-
-module.exports = app;
+app.get("/api/bank/:userId/parrain/stats", async (req, res
