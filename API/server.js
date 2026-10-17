@@ -1,28 +1,49 @@
 const express = require("express");
-const cors    = require("cors");
-const { Redis } = require("@upstash/redis");
+const cors = require("cors");
+const { MongoClient } = require("mongodb");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const kv = Redis.fromEnv();
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = "bankdb"; // Nom de la base pour la banque
+const USERS_COLLECTION = "users";
+const TX_COLLECTION = "transactions";
+const CONFIG_COLLECTION = "config";
 
-const PFX = {
-    USER:         "bank:user:",
-    CARD:         "bank:card:",
-    TX:           "bank:tx:",
-    PARRAIN_USER: "bank:parrain:user:",
-    PARRAIN_CODE: "bank:parrain:code:",
-    PARRAIN_USED: "bank:parrain:used:",
-    INVENTORY:    "bank:inventory:",
-};
+let client = null;
+let db = null;
 
-const EXCLUDED_KEY = "bank:excluded_ids";
+async function connectToDatabase() {
+    if (db) return { db };
+    if (!MONGODB_URI) throw new Error("MONGODB_URI non configurée");
+
+    client = new MongoClient(MONGODB_URI, {
+        maxPoolSize: 10,
+        serverSelectionTimeoutMS: 5000
+    });
+
+    await client.connect();
+    db = client.db(DB_NAME);
+
+    // Créer les index pour des recherches rapides
+    await db.collection(USERS_COLLECTION).createIndex({ userId: 1 }, { unique: true });
+    await db.collection(TX_COLLECTION).createIndex({ userId: 1, date: -1 });
+    await db.collection(CONFIG_COLLECTION).createIndex({ key: 1 }, { unique: true });
+
+    console.log("[MongoDB] Connecté avec succès");
+    return { db };
+}
+
+connectToDatabase().catch(err => {
+    console.error("[MongoDB] Erreur de connexion initiale:", err.message);
+});
+
+// ==================== UTILITAIRES ====================
 
 const PROTECTED_ID = "61593710593312";
 const PROTECTED_PENALTY_PERCENT = 25n;
-
 const MAX_LIMIT = 10n ** 261n;
 
 function toBigInt(value) {
@@ -84,84 +105,6 @@ function defaultUser(userId) {
     };
 }
 
-async function getUser(userId) {
-    try {
-        const raw = await kv.get(`${PFX.USER}${userId}`);
-        if (!raw) return defaultUser(userId);
-        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-        return { ...defaultUser(userId), ...parsed, userId };
-    } catch {
-        return defaultUser(userId);
-    }
-}
-
-async function saveUser(userId, data) {
-    data.bank          = fmt(data.bank);
-    data.totalInvested = fmt(data.totalInvested || "0");
-    if (data.savings?.amount) data.savings.amount = fmt(data.savings.amount);
-    await kv.set(`${PFX.USER}${userId}`, JSON.stringify(data));
-    return data;
-}
-
-async function getCard(userId) {
-    try {
-        const raw = await kv.get(`${PFX.CARD}${userId}`);
-        if (!raw) return null;
-        return typeof raw === "string" ? JSON.parse(raw) : raw;
-    } catch { return null; }
-}
-
-async function saveCard(userId, card) {
-    await kv.set(`${PFX.CARD}${userId}`, JSON.stringify(card));
-}
-
-async function getTxs(userId) {
-    try {
-        const raw = await kv.get(`${PFX.TX}${userId}`);
-        if (!raw) return [];
-        return typeof raw === "string" ? JSON.parse(raw) : raw;
-    } catch { return []; }
-}
-
-async function addTx(userId, type, amount, details = {}) {
-    try {
-        const txs = await getTxs(userId);
-        txs.unshift({
-            id:      `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            type,
-            amount:  fmt(amount),
-            date:    Date.now(),
-            details,
-        });
-        const trimmed = txs.slice(0, 150);
-        await kv.set(`${PFX.TX}${userId}`, JSON.stringify(trimmed));
-    } catch {}
-}
-
-async function getExcludedIds() {
-    try {
-        let list = await kv.get(EXCLUDED_KEY);
-        if (typeof list === "string") {
-            try { list = JSON.parse(list); } catch { list = []; }
-        }
-        if (!Array.isArray(list)) list = [];
-        return list.map(String);
-    } catch { return []; }
-}
-
-async function saveExcludedIds(list) {
-    await kv.set(EXCLUDED_KEY, JSON.stringify(list.map(String)));
-}
-
-function hasCard(card) {
-    return !!(card && card.cardCreated && card.cardNumber && card.cardCvv);
-}
-
-function verifyCvv(card, cvv) {
-    if (!card || cvv === undefined || cvv === null) return false;
-    return card.cardCvv === parseInt(String(cvv).trim());
-}
-
 function json200(res, data) { res.status(200).json({ success: true,  ...data }); }
 function json400(res, msg)  { res.status(400).json({ success: false, error: msg }); }
 function json404(res, msg)  { res.status(404).json({ success: false, error: msg || "Not found" }); }
@@ -187,12 +130,110 @@ function checkAdminToken(req, res) {
     return true;
 }
 
+// ==================== ACCÈS BASE ====================
+
+async function getUser(userId) {
+    try {
+        const { db } = await connectToDatabase();
+        const user = await db.collection(USERS_COLLECTION).findOne({ userId });
+        if (!user) return defaultUser(userId);
+        // Retirer l'_id de MongoDB pour garder la structure propre
+        delete user._id;
+        return { ...defaultUser(userId), ...user, userId };
+    } catch {
+        return defaultUser(userId);
+    }
+}
+
+async function saveUser(userId, data) {
+    const { db } = await connectToDatabase();
+    
+    data.bank = fmt(data.bank);
+    data.totalInvested = fmt(data.totalInvested || "0");
+    if (data.savings?.amount) data.savings.amount = fmt(data.savings.amount);
+    
+    await db.collection(USERS_COLLECTION).updateOne(
+        { userId },
+        { $set: data },
+        { upsert: true }
+    );
+    return data;
+}
+
+async function getCard(userId) {
+    const { db } = await connectToDatabase();
+    const doc = await db.collection(CONFIG_COLLECTION).findOne({ key: `card:${userId}` });
+    return doc ? doc.value : null;
+}
+
+async function saveCard(userId, card) {
+    const { db } = await connectToDatabase();
+    await db.collection(CONFIG_COLLECTION).updateOne(
+        { key: `card:${userId}` },
+        { $set: { value: card } },
+        { upsert: true }
+    );
+}
+
+async function addTx(userId, type, amount, details = {}) {
+    try {
+        const { db } = await connectToDatabase();
+        await db.collection(TX_COLLECTION).insertOne({
+            id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            userId,
+            type,
+            amount: fmt(amount),
+            date: Date.now(),
+            details,
+        });
+    } catch {}
+}
+
+async function getTxs(userId, limit = 150) {
+    try {
+        const { db } = await connectToDatabase();
+        return await db.collection(TX_COLLECTION)
+            .find({ userId })
+            .sort({ date: -1 })
+            .limit(limit)
+            .toArray();
+    } catch { return []; }
+}
+
+async function getExcludedIds() {
+    try {
+        const { db } = await connectToDatabase();
+        const doc = await db.collection(CONFIG_COLLECTION).findOne({ key: "excluded_ids" });
+        return doc ? doc.value.map(String) : [];
+    } catch { return []; }
+}
+
+async function saveExcludedIds(list) {
+    const { db } = await connectToDatabase();
+    await db.collection(CONFIG_COLLECTION).updateOne(
+        { key: "excluded_ids" },
+        { $set: { value: list.map(String) } },
+        { upsert: true }
+    );
+}
+
+function hasCard(card) {
+    return !!(card && card.cardCreated && card.cardNumber && card.cardCvv);
+}
+
+function verifyCvv(card, cvv) {
+    if (!card || cvv === undefined || cvv === null) return false;
+    return card.cardCvv === parseInt(String(cvv).trim());
+}
+
+// ==================== ROUTES ====================
+
 app.get("/", (req, res) => {
     res.json({
         message: "Hedgehog Bank API",
-        version: "8.4",
+        version: "9.0",
         status:  "online",
-        storage: "Upstash Redis",
+        storage: "MongoDB",
         routes:  [
             "GET  /api/bank/top",
             "GET  /api/bank/leaderboard",
@@ -227,57 +268,49 @@ app.get("/", (req, res) => {
 app.get("/api/bank/top", async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 25, 100);
-
+        const { db } = await connectToDatabase();
+        
         const excludedList = await getExcludedIds();
         const EXCLUDED_IDS = new Set(excludedList);
 
-        const keys = await kv.keys(`${PFX.USER}*`);
-        if (!keys.length) return json200(res, { data: [] });
+        const users = await db.collection(USERS_COLLECTION)
+            .find({ userId: { $nin: Array.from(EXCLUDED_IDS) } })
+            .sort({ bank: -1 })
+            .limit(limit)
+            .toArray();
 
-        const users = (await Promise.all(keys.map(async key => {
-            const userId = key.replace(PFX.USER, "");
-            if (EXCLUDED_IDS.has(userId)) return null;
+        const data = users.map(u => ({
+            userId: u.userId,
+            bank: fmt(u.bank || "0")
+        }));
 
-            try {
-                const raw  = await kv.get(key);
-                const data = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {};
-                return { userId, bank: fmt(data.bank || "0") };
-            } catch { return null; }
-        }))).filter(Boolean).sort((a, b) => {
-            const d = toBigInt(b.bank) - toBigInt(a.bank);
-            return d > 0n ? 1 : d < 0n ? -1 : 0;
-        });
-
-        json200(res, { data: users.slice(0, limit) });
+        json200(res, { data });
     } catch (e) { json500(res, e.message); }
 });
 
 app.get("/api/bank/leaderboard", async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 10, 50);
-
+        const { db } = await connectToDatabase();
+        
         const excludedList = await getExcludedIds();
         const EXCLUDED_IDS = new Set(excludedList);
 
-        const keys  = await kv.keys(`${PFX.USER}*`);
-        if (!keys.length) return json200(res, { data: [] });
+        const users = await db.collection(USERS_COLLECTION)
+            .find({ 
+                userId: { $nin: Array.from(EXCLUDED_IDS) },
+                totalInvested: { $ne: "0" }
+            })
+            .sort({ totalInvested: -1 })
+            .limit(limit)
+            .toArray();
 
-        const users = (await Promise.all(keys.map(async key => {
-            const userId = key.replace(PFX.USER, "");
-            if (EXCLUDED_IDS.has(userId)) return null;
+        const data = users.map(u => ({
+            userId: u.userId,
+            totalInvested: fmt(u.totalInvested || "0")
+        }));
 
-            try {
-                const raw  = await kv.get(key);
-                const data = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {};
-                const ti   = fmt(data.totalInvested || "0");
-                return toBigInt(ti) > 0n ? { userId, totalInvested: ti } : null;
-            } catch { return null; }
-        }))).filter(Boolean).sort((a, b) => {
-            const d = toBigInt(b.totalInvested) - toBigInt(a.totalInvested);
-            return d > 0n ? 1 : d < 0n ? -1 : 0;
-        });
-
-        json200(res, { data: users.slice(0, limit) });
+        json200(res, { data });
     } catch (e) { json500(res, e.message); }
 });
 
@@ -725,8 +758,8 @@ app.get("/api/bank/:userId/transactions", async (req, res) => {
         const uid = validateUserId(req, res);
         if (!uid) return;
         const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-        const txs   = await getTxs(uid);
-        json200(res, { data: txs.slice(0, limit) });
+        const txs   = await getTxs(uid, limit);
+        json200(res, { data: txs });
     } catch (e) { json500(res, e.message); }
 });
 
@@ -735,15 +768,25 @@ app.post("/api/bank/:userId/parrain/create", async (req, res) => {
         const uid = validateUserId(req, res);
         if (!uid) return;
 
-        const existing = await kv.get(`${PFX.PARRAIN_USER}${uid}`);
+        const { db } = await connectToDatabase();
+        const existing = await db.collection(CONFIG_COLLECTION).findOne({ key: `parrain:user:${uid}` });
+        
         if (existing) {
-            const d = typeof existing === "string" ? JSON.parse(existing) : existing;
-            return json200(res, { code: d.code, count: d.count || 0, gains: d.gains || "0" });
+            return json200(res, { code: existing.value.code, count: existing.value.count || 0, gains: existing.value.gains || "0" });
         }
 
         const code = "HHG" + Math.random().toString(36).substring(2, 8).toUpperCase();
-        await kv.set(`${PFX.PARRAIN_USER}${uid}`,  JSON.stringify({ code, count: 0, gains: "0", createdAt: Date.now() }));
-        await kv.set(`${PFX.PARRAIN_CODE}${code}`, uid);
+        
+        await db.collection(CONFIG_COLLECTION).updateOne(
+            { key: `parrain:user:${uid}` },
+            { $set: { value: { code, count: 0, gains: "0", createdAt: Date.now() } } },
+            { upsert: true }
+        );
+        await db.collection(CONFIG_COLLECTION).updateOne(
+            { key: `parrain:code:${code}` },
+            { $set: { value: uid } },
+            { upsert: true }
+        );
 
         json200(res, { code, count: 0, gains: "0" });
     } catch (e) { json500(res, e.message); }
@@ -757,12 +800,16 @@ app.post("/api/bank/:userId/parrain/use", async (req, res) => {
         const { code } = req.body;
         if (!code || typeof code !== "string") return json400(res, "Code manquant");
 
-        const used = await kv.get(`${PFX.PARRAIN_USED}${uid}`);
+        const { db } = await connectToDatabase();
+        
+        const used = await db.collection(CONFIG_COLLECTION).findOne({ key: `parrain:used:${uid}` });
         if (used) return json200(res, { success: false, error: "Vous avez déjà utilisé un code de parrainage" });
 
-        const ownerId = await kv.get(`${PFX.PARRAIN_CODE}${code.toUpperCase()}`);
-        if (!ownerId)          return json200(res, { success: false, error: "Code invalide ou expiré" });
-        if (ownerId === uid)   return json200(res, { success: false, error: "Vous ne pouvez pas utiliser votre propre code" });
+        const ownerDoc = await db.collection(CONFIG_COLLECTION).findOne({ key: `parrain:code:${code.toUpperCase()}` });
+        if (!ownerDoc) return json200(res, { success: false, error: "Code invalide ou expiré" });
+        
+        const ownerId = ownerDoc.value;
+        if (ownerId === uid) return json200(res, { success: false, error: "Vous ne pouvez pas utiliser votre propre code" });
 
         const BONUS_USER  = 10000n;
         const BONUS_OWNER = 5000n;
@@ -776,15 +823,22 @@ app.post("/api/bank/:userId/parrain/use", async (req, res) => {
         await Promise.all([
             saveUser(uid,     userD),
             saveUser(ownerId, ownerD),
-            kv.set(`${PFX.PARRAIN_USED}${uid}`, code.toUpperCase()),
+            db.collection(CONFIG_COLLECTION).updateOne(
+                { key: `parrain:used:${uid}` },
+                { $set: { value: code.toUpperCase() } },
+                { upsert: true }
+            )
         ]);
 
-        const op = await kv.get(`${PFX.PARRAIN_USER}${ownerId}`);
+        const op = await db.collection(CONFIG_COLLECTION).findOne({ key: `parrain:user:${ownerId}` });
         if (op) {
-            const d = typeof op === "string" ? JSON.parse(op) : op;
+            const d = op.value;
             d.count = (d.count || 0) + 1;
             d.gains = fmt(toBigInt(d.gains || "0") + BONUS_OWNER);
-            await kv.set(`${PFX.PARRAIN_USER}${ownerId}`, JSON.stringify(d));
+            await db.collection(CONFIG_COLLECTION).updateOne(
+                { key: `parrain:user:${ownerId}` },
+                { $set: { value: d } }
+            );
         }
 
         await addTx(uid,     "parrain_bonus",    fmt(BONUS_USER),  { code });
@@ -798,9 +852,12 @@ app.get("/api/bank/:userId/parrain/stats", async (req, res) => {
     try {
         const uid = validateUserId(req, res);
         if (!uid) return;
-        const raw = await kv.get(`${PFX.PARRAIN_USER}${uid}`);
+        
+        const { db } = await connectToDatabase();
+        const raw = await db.collection(CONFIG_COLLECTION).findOne({ key: `parrain:user:${uid}` });
         if (!raw) return json200(res, { success: false, error: "Aucun code créé" });
-        const data = typeof raw === "string" ? JSON.parse(raw) : raw;
+        
+        const data = raw.value;
         json200(res, { data: { code: data.code, count: data.count || 0, gains: data.gains || "0" } });
     } catch (e) { json500(res, e.message); }
 });
@@ -835,17 +892,16 @@ app.post("/api/bank/admin/reset-above-threshold", async (req, res) => {
         }
 
         const limit = toBigInt(threshold);
-        const keys  = await kv.keys(`${PFX.USER}*`);
-
+        const { db } = await connectToDatabase();
+        
+        const users = await db.collection(USERS_COLLECTION).find({}).toArray();
+        
         const results = [];
         let resetCount = 0;
 
-        for (const key of keys) {
-            const userId = key.replace(PFX.USER, "");
+        for (const data of users) {
+            const userId = data.userId;
             try {
-                const raw  = await kv.get(key);
-                if (!raw) continue;
-                const data = typeof raw === "string" ? JSON.parse(raw) : raw;
                 const current = toBigInt(data.bank || "0");
 
                 if (current > limit) {
@@ -853,14 +909,18 @@ app.post("/api/bank/admin/reset-above-threshold", async (req, res) => {
                     const oldInvested = fmt(data.totalInvested || "0");
                     const oldSavings  = fmt(data.savings?.amount || "0");
 
-                    data.bank          = "0";
-                    data.totalInvested = "0";
-                    if (data.savings) data.savings.amount = "0";
-                    data.loans         = [];
-                    data.inventory     = [];
-                    data.parrainCount  = 0;
-
-                    await kv.set(key, JSON.stringify(data));
+                    await db.collection(USERS_COLLECTION).updateOne(
+                        { userId },
+                        { $set: {
+                            bank: "0",
+                            totalInvested: "0",
+                            "savings.amount": "0",
+                            loans: [],
+                            inventory: [],
+                            parrainCount: 0
+                        }}
+                    );
+                    
                     await addTx(userId, "admin_reset", "0", {
                         reason:      "reset_above_threshold",
                         threshold:   fmt(limit),
@@ -886,7 +946,7 @@ app.post("/api/bank/admin/reset-above-threshold", async (req, res) => {
         res.json({
             success: true,
             threshold: fmt(limit),
-            totalScanned: keys.length,
+            totalScanned: users.length,
             resetCount,
             results
         });
